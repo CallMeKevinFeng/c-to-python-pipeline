@@ -1,0 +1,5 @@
+{
+  "model": "claude-4.0-sonnet",
+  "apiKey": "your-api-key-here",
+  "apiBase": "https://openai.sufy.com/v1"
+}
