@@ -46,6 +46,74 @@ if [ ! -f "$C_FILE" ]; then
   exit 1
 fi
 
+# ── 清理无效 UTF-8 字符 ──
+clean_utf8() {
+  cd "$WORKDIR"
+  python3 -c "
+import glob
+for f in glob.glob('*.c') + glob.glob('*.py') + glob.glob('*.txt'):
+    try:
+        with open(f, 'rb') as fh: data = fh.read()
+        clean = data.decode('utf-8', errors='ignore').encode('utf-8')
+        with open(f, 'wb') as fh: fh.write(clean)
+    except:
+        pass
+" 2>/dev/null || true
+  cd - > /dev/null
+}
+
+# ── 删除 Python 文件中的非 ASCII 行（保留 shebang/coding） ──
+sanitize_python() {
+  cd "$WORKDIR"
+  for f in *.py; do
+    [ ! -f "$f" ] && continue
+    python3 -c "
+with open('$f', 'r', errors='ignore') as fh:
+    lines = fh.readlines()
+new_lines = []
+for line in lines:
+    if line.startswith('#!') or 'coding' in line:
+        new_lines.append(line)
+        continue
+    # 如果包含非 ASCII 字符，整行跳过
+    if any(ord(c) > 127 for c in line):
+        continue
+    new_lines.append(line)
+with open('$f', 'w') as fh:
+    fh.writelines(new_lines)
+"
+  done
+  cd - > /dev/null
+}
+
+# ── 文件拆分（处理有无代码块标记） ──
+split_files() {
+  local input_file="$1"
+  cd "$WORKDIR"
+  awk '
+  /^===FILE:/ {
+      if (outfile) close(outfile)
+      filename = substr($0, 9, length($0)-11)
+      outfile = filename
+      in_file = 1
+      code_block = 0
+      next
+  }
+  in_file && outfile {
+      if ($0 ~ /^```/) {
+          code_block = !code_block
+          next
+      }
+      if (code_block || $0 !~ /^```/) {
+          print > outfile
+      }
+  }
+  ' "$input_file"
+  cd - > /dev/null
+  clean_utf8
+  sanitize_python
+}
+
 # ── 读取云端配置 ──
 if [ -f "$CONFIG_FILE" ]; then
   echo "==> 读取云端配置: $CONFIG_FILE"
@@ -74,28 +142,39 @@ prompt = template.replace('{{MODULE_NAME}}', '$MODULE_NAME').replace('{{C_CODE}}
 sys.stdout.write(prompt)
 " | ollama run codellama:7b > "$WORKDIR/generated_raw.txt"
 
-  cd "$WORKDIR"
-  awk '/^===FILE:/ {
-      filename = substr($0, 9, length($0)-11)
-      if (outfile) close(outfile)
-      outfile = filename
-      next
-  }
-  /^```/ { in_code = !in_code; next }
-  in_code && outfile { print > outfile }' generated_raw.txt
+  split_files "generated_raw.txt"
 
-  if [ ! -f "${MODULE_NAME}.c" ]; then
-    FOUND_C=$(ls *.c 2>/dev/null | grep -v test | head -1)
+  if [ ! -f "$WORKDIR/${MODULE_NAME}.c" ]; then
+    FOUND_C=$(cd "$WORKDIR" && ls *.c 2>/dev/null | grep -v test | head -1)
     if [ -n "$FOUND_C" ]; then
       echo "Warning: CodeLlama 生成了 '$FOUND_C' 而非 '${MODULE_NAME}.c'，已自动纠正"
-      mv "$FOUND_C" "${MODULE_NAME}.c"
+      mv "$WORKDIR/$FOUND_C" "$WORKDIR/${MODULE_NAME}.c"
     else
       echo "Error: 未生成任何 C 扩展文件"
-      cat generated_raw.txt
+      cat "$WORKDIR/generated_raw.txt"
       exit 1
     fi
   fi
+
+  # 快速编译预检
+  echo "==> 快速编译预检..."
+  cd "$WORKDIR"
+  if python3 -c "
+import subprocess, sys
+try:
+    subprocess.run(['python3', 'setup.py', 'build_ext', '--inplace'],
+                   check=True, capture_output=True)
+    print('编译预检通过')
+except subprocess.CalledProcessError as e:
+    sys.exit(1)
+" 2>/dev/null; then
+    echo "==> 预检通过"
+  else
+    echo "Warning: 编译预检失败，请检查 ${MODULE_NAME}.c 是否包含完整的函数实现"
+    echo "你可以手动修复后从 Step 2 继续: $0 $C_FILE $MODULE_NAME --resume step2"
+  fi
   cd - > /dev/null
+
   echo "==> Step 1 完成"
 else
   echo "==> 跳过 Step 1（从 Step $RESUME_STEP 开始）"
@@ -121,17 +200,9 @@ prompt = template.replace('{{MODULE_NAME}}', '$MODULE_NAME') \
 sys.stdout.write(prompt)
 " | ollama run qwen2.5:14b > "$WORKDIR/review_qwen_raw.txt"
 
-  cd "$WORKDIR"
-  awk '/^===FILE:/ {
-      filename = substr($0, 9, length($0)-11)
-      if (outfile) close(outfile)
-      outfile = filename
-      next
-  }
-  /^```/ { in_code = !in_code; next }
-  in_code && outfile { print > outfile }' review_qwen_raw.txt
-  cd - > /dev/null
+  split_files "review_qwen_raw.txt"
 
+  # 补全缺失文件
   if [ ! -f "$WORKDIR/${MODULE_NAME}_final.c" ]; then
     cp "$WORKDIR/${MODULE_NAME}.c" "$WORKDIR/${MODULE_NAME}_final.c"
   fi
@@ -186,16 +257,7 @@ print(prompt)
           messages: [{role: "user", content: $prompt}]
         }')" > "$WORKDIR/review_claude_raw.txt"
 
-  cd "$WORKDIR"
-  awk '/^===FILE:/ {
-      filename = substr($0, 9, length($0)-11)
-      if (outfile) close(outfile)
-      outfile = filename
-      next
-  }
-  /^```/ { in_code = !in_code; next }
-  in_code && outfile { print > outfile }' review_claude_raw.txt
-  cd - > /dev/null
+  split_files "review_claude_raw.txt"
 
   if [ ! -f "$WORKDIR/${MODULE_NAME}_reviewed.c" ]; then
     cp "$WORKDIR/${MODULE_NAME}_final.c" "$WORKDIR/${MODULE_NAME}_reviewed.c"
